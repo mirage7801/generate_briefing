@@ -11,6 +11,7 @@ three-slide PowerPoint briefing with python-pptx.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -29,7 +30,9 @@ from pptx.util import Inches, Pt
 from pypdf import PdfReader
 
 
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_MODEL = "gpt-4o-mini"
+_LLM_CLIENT: OpenAI | None = None
+_LLM_MODEL = DEFAULT_MODEL
 
 COLORS = {
     "deep_blue": RGBColor(0x0B, 0x1F, 0x3A),
@@ -44,6 +47,25 @@ COLORS = {
 
 class BriefingError(RuntimeError):
     """Raised for user-facing briefing generation failures."""
+
+
+def get_llm_config(args: argparse.Namespace) -> tuple[OpenAI, str]:
+    """Build an OpenAI-compatible client and select a model without persisting secrets."""
+    api_key = (
+        getattr(args, "api_key", None)
+        or os.getenv("API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("DEEPSEEK_API_KEY")
+    )
+    if not api_key:
+        api_key = getpass.getpass("No API key found. Please enter your API key: ")
+    if not api_key:
+        raise BriefingError("API key cannot be empty.")
+
+    base_url = getattr(args, "base_url", None) or os.getenv("API_BASE_URL")
+    model = getattr(args, "model", None) or os.getenv("API_MODEL") or DEFAULT_MODEL
+    client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+    return client, model
 
 
 def load_document(file_path: str | Path) -> str:
@@ -487,15 +509,13 @@ selected original context：
 
 
 def call_llm(prompt: str) -> str:
-    """Call OpenAI Chat Completions and return text content."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise BriefingError("OPENAI_API_KEY is not set. Please set it before running the script.")
+    """Call the configured OpenAI-compatible Chat Completions API."""
+    if _LLM_CLIENT is None:
+        raise BriefingError("LLM client is not configured.")
 
     try:
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model=DEFAULT_MODEL,
+        response = _LLM_CLIENT.chat.completions.create(
+            model=_LLM_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -507,7 +527,11 @@ def call_llm(prompt: str) -> str:
         )
         content = response.choices[0].message.content or ""
     except Exception as exc:
-        raise BriefingError(f"LLM API call failed: {exc}") from exc
+        error_message = str(exc)
+        configured_key = getattr(_LLM_CLIENT, "api_key", None)
+        if configured_key:
+            error_message = error_message.replace(configured_key, "[REDACTED]")
+        raise BriefingError(f"LLM API call failed: {error_message}") from exc
 
     if not content.strip():
         raise BriefingError("LLM API returned empty output.")
@@ -913,14 +937,19 @@ def _normalize_timeline(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def main() -> None:
+    global _LLM_CLIENT, _LLM_MODEL
     parser = argparse.ArgumentParser(description="Generate an AI + hardware co-design briefing deck from a PDF or TXT paper.")
     parser.add_argument("--input", required=True, help="Input paper path, PDF or TXT.")
     parser.add_argument("--output", default="briefing.pptx", help="Output PPTX path. Default: briefing.pptx")
     parser.add_argument("--max-chars", type=int, default=3000, help="Maximum characters per chunk. Default: 3000")
     parser.add_argument("--overlap", type=int, default=250, help="Overlap characters between chunks. Default: 250")
+    parser.add_argument("--api-key", help="API key (prefer hidden prompt or an environment variable).")
+    parser.add_argument("--base-url", help="OpenAI-compatible API base URL. Defaults to the OpenAI endpoint.")
+    parser.add_argument("--model", help="Model name. Default: API_MODEL or gpt-4o-mini.")
     args = parser.parse_args()
 
     try:
+        _LLM_CLIENT, _LLM_MODEL = get_llm_config(args)
         raw_text = load_document(args.input)
         text = clean_text(raw_text)
         if not text:

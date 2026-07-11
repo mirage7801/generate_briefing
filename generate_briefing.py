@@ -309,6 +309,134 @@ def chunk_text(text: str, max_chars: int = 3000, overlap_chars: int = 250) -> li
     return chunks
 
 
+# Sentence-aware implementations used by the document pipeline. They supersede
+# the legacy character-oriented versions above while preserving the public API.
+_SENTENCE_ENDINGS = "。.?？!！"
+
+
+def _find_sentence_cut(candidate: str) -> int:
+    """Return a cut after the last valid sentence ending, ignoring decimal points."""
+    for index in range(len(candidate) - 1, -1, -1):
+        mark = candidate[index]
+        if mark not in _SENTENCE_ENDINGS:
+            continue
+        if mark == "." and 0 < index < len(candidate) - 1:
+            if candidate[index - 1].isdigit() and candidate[index + 1].isdigit():
+                continue
+        return index + 1
+    return -1
+
+
+def split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
+    """Split an oversized paragraph at the nearest preceding sentence boundary."""
+    paragraph = str(paragraph or "").strip()
+    if not paragraph:
+        return []
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive.")
+
+    parts: list[str] = []
+    remaining = paragraph
+    while len(remaining) > max_chars:
+        candidate = remaining[:max_chars]
+        cut = _find_sentence_cut(candidate)
+        if cut < 0:
+            cut = candidate.rfind(" ")
+            if cut <= 0:
+                cut = max_chars
+
+        part = remaining[:cut].strip()
+        if not part:  # Defensive progress guarantee for unusual whitespace.
+            part = remaining[:max_chars]
+            cut = max_chars
+        parts.append(part)
+        remaining = remaining[cut:].lstrip()
+
+    if remaining:
+        parts.append(remaining.strip())
+    return parts
+
+
+def _complete_sentence_overlap(text: str, section_title: str, overlap_chars: int) -> str:
+    """Return a short suffix composed only of complete sentences."""
+    if overlap_chars <= 0:
+        return ""
+    body = text.strip()
+    if section_title and body.startswith(section_title):
+        body = body[len(section_title):].lstrip()
+    sentences = [
+        match.group(0).strip()
+        for match in re.finditer(rf"[^{re.escape(_SENTENCE_ENDINGS)}]+[{re.escape(_SENTENCE_ENDINGS)}]", body)
+        if match.group(0).strip()
+    ]
+    selected: list[str] = []
+    total = 0
+    for sentence in reversed(sentences):
+        added = len(sentence) + (1 if selected else 0)
+        if added > overlap_chars or total + added > overlap_chars:
+            break
+        selected.append(sentence)
+        total += added
+    return " ".join(reversed(selected))
+
+
+def chunk_text(text: str, max_chars: int = 3000, overlap_chars: int = 250) -> list[dict[str, Any]]:
+    """Build section-aware chunks using paragraph and sentence boundaries."""
+    if max_chars <= 500:
+        raise BriefingError("--max-chars should be greater than 500.")
+    if overlap_chars < 0 or overlap_chars >= max_chars:
+        raise BriefingError("--overlap must be non-negative and smaller than --max-chars.")
+
+    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n+", text) if paragraph.strip()]
+    chunks: list[dict[str, Any]] = []
+    current_parts: list[str] = []
+    current_section = ""
+
+    def render(parts: list[str], section_title: str) -> str:
+        body = "\n\n".join(part for part in parts if part).strip()
+        if section_title and not body.startswith(section_title):
+            return f"{section_title}\n\n{body}" if body else section_title
+        return body
+
+    def save_current() -> str:
+        if not current_parts:
+            return ""
+        body = render(current_parts, current_section)
+        chunks.append({
+            "chunk_id": len(chunks) + 1,
+            "section_title": current_section,
+            "text": body,
+        })
+        return body
+
+    for paragraph in paragraphs:
+        detected_title = detect_section_title(paragraph)
+        if detected_title:
+            if current_parts:
+                save_current()
+                current_parts = []
+            current_section = detected_title
+            current_parts = [detected_title]
+            continue
+
+        content_limit = max_chars - (len(current_section) + 2 if current_section else 0)
+        pieces = split_long_paragraph(paragraph, max(1, content_limit))
+        for piece in pieces:
+            proposed = render(current_parts + [piece], current_section)
+            if current_parts and len(proposed) > max_chars:
+                previous_body = save_current()
+                overlap = _complete_sentence_overlap(previous_body, current_section, overlap_chars)
+                current_parts = [overlap] if overlap else []
+                proposed = render(current_parts + [piece], current_section)
+                if overlap and len(proposed) > max_chars:
+                    current_parts = []
+            current_parts.append(piece)
+
+    if current_parts:
+        save_current()
+    return chunks
+
+
 def build_nil_prompt(chunk: dict[str, Any]) -> str:
     """Build the per-chunk NIL extraction prompt."""
     return f"""
@@ -1079,7 +1207,7 @@ def add_textbox(
 
 
 def shorten_text(text: Any, max_len: int) -> str:
-    """Shorten display text without changing the source briefing data."""
+    """Shorten display text at natural boundaries without splitting technical terms."""
     if text is None:
         return ""
     value = re.sub(r"\s+", " ", str(text)).strip()
@@ -1087,7 +1215,41 @@ def shorten_text(text: Any, max_len: int) -> str:
         return ""
     if len(value) <= max_len:
         return value
-    return value[: max_len - 1].rstrip() + "…"
+
+    protected_phrases = (
+        "AI-in-the-loop",
+        "differentiable simulator",
+        "hardware-aware training",
+        "neural architecture search",
+    )
+    cutoff = max_len
+    lower_value = value.lower()
+    protected_spans = []
+    for phrase in protected_phrases:
+        start = lower_value.find(phrase.lower())
+        end = start + len(phrase)
+        if start >= 0:
+            protected_spans.append((start, end))
+        if start >= 0 and start < cutoff < end:
+            cutoff = end
+
+    # Never split a hyphenated word or another contiguous English token.
+    if 0 < cutoff < len(value) and re.match(r"[A-Za-z0-9-]", value[cutoff - 1]) and re.match(r"[A-Za-z0-9-]", value[cutoff]):
+        token_end = re.search(r"[^A-Za-z0-9-]", value[cutoff:])
+        cutoff = cutoff + token_end.start() if token_end else len(value)
+
+    if cutoff >= len(value):
+        return value
+
+    minimum_boundary = max(1, int(max_len * 0.6))
+    boundary_chars = "，。,.;； "
+    boundary = max((value.rfind(char, minimum_boundary, cutoff + 1) for char in boundary_chars), default=-1)
+    if boundary >= minimum_boundary:
+        containing_span = next(((start, end) for start, end in protected_spans if start < boundary < end), None)
+        cutoff = containing_span[1] if containing_span else boundary + (1 if value[boundary] != " " else 0)
+
+    shortened = value[:cutoff].rstrip(" ，。,.;；")
+    return shortened + "…"
 
 
 def shorten_list(items: Any, max_items: int, max_len_each: int) -> list[str]:
@@ -1095,6 +1257,20 @@ def shorten_list(items: Any, max_items: int, max_len_each: int) -> list[str]:
     if not isinstance(items, list):
         items = [items] if items else []
     return [value for value in (shorten_text(item, max_len_each) for item in items[:max_items]) if value]
+
+
+def _limit_ellipsis(items: list[str], max_count: int = 1) -> list[str]:
+    """Limit ellipses across one card while preserving already shortened phrases."""
+    used = 0
+    result = []
+    for item in items:
+        if "…" in item:
+            if used >= max_count:
+                item = item.replace("…", "")
+            else:
+                used += 1
+        result.append(item)
+    return result
 
 
 def add_title_slide(prs: Presentation, data: dict[str, Any]) -> None:
@@ -1122,6 +1298,10 @@ def _add_layer_card_v2(slide, x: float, layer: dict[str, Any]) -> None:
     role = shorten_text(layer.get("role", "论文未明确说明"), 36)
     features = shorten_list(layer.get("key_features", []), 2, 24)
     examples = shorten_list(layer.get("examples", []), 1, 24)
+    card_texts = _limit_ellipsis([role, *features, *examples])
+    role = card_texts[0]
+    features = card_texts[1:1 + len(features)]
+    examples = card_texts[1 + len(features):]
     body_lines = ["核心作用：", role, "", "关键特征："]
     body_lines.extend(f"• {feature}" for feature in features)
     body_lines.extend(["", "例子：", examples[0] if examples else "论文未明确说明"])

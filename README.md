@@ -51,9 +51,11 @@ python generate_briefing.py --input paper.pdf --output briefing.pptx
 
 其他运行示例：
 
+默认 chunk 参数为 `--max-chars 7000` 和 `--overlap 300`。用户仍可通过命令行指定其他值：
+
 ```powershell
 python generate_briefing.py --input paper.txt --output briefing.pptx
-python generate_briefing.py --input paper.pdf --output briefing.pptx --max-chars 3000 --overlap 250
+python generate_briefing.py --input paper.pdf --output briefing.pptx --max-chars 5000 --overlap 300
 ```
 
 ## 安全提醒

@@ -941,8 +941,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate an AI + hardware co-design briefing deck from a PDF or TXT paper.")
     parser.add_argument("--input", required=True, help="Input paper path, PDF or TXT.")
     parser.add_argument("--output", default="briefing.pptx", help="Output PPTX path. Default: briefing.pptx")
-    parser.add_argument("--max-chars", type=int, default=3000, help="Maximum characters per chunk. Default: 3000")
-    parser.add_argument("--overlap", type=int, default=250, help="Overlap characters between chunks. Default: 250")
+    parser.add_argument("--max-chars", type=int, default=7000, help="Maximum characters per chunk. Default: 7000")
+    parser.add_argument("--overlap", type=int, default=300, help="Overlap characters between chunks. Default: 300")
     parser.add_argument("--api-key", help="API key (prefer hidden prompt or an environment variable).")
     parser.add_argument("--base-url", help="OpenAI-compatible API base URL. Defaults to the OpenAI endpoint.")
     parser.add_argument("--model", help="Model name. Default: API_MODEL or gpt-4o-mini.")
@@ -955,6 +955,7 @@ def main() -> None:
         if not text:
             raise BriefingError("Input document contains no usable text after cleaning.")
         chunks = chunk_text(text, max_chars=args.max_chars, overlap_chars=args.overlap)
+        print(f"Document split into {len(chunks)} chunks.")
         data = extract_briefing_data(chunks)
         create_ppt(data, args.output)
         print(f"{args.output} generated successfully.")

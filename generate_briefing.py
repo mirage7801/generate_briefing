@@ -16,7 +16,6 @@ import json
 import os
 import re
 import sys
-import textwrap
 import warnings
 from pathlib import Path
 from typing import Any
@@ -26,8 +25,6 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
-from pptx.oxml.ns import qn
-from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Inches, Pt
 from pypdf import PdfReader
 
@@ -309,143 +306,9 @@ def chunk_text(text: str, max_chars: int = 3000, overlap_chars: int = 250) -> li
     return chunks
 
 
-# Sentence-aware implementations used by the document pipeline. They supersede
-# the legacy character-oriented versions above while preserving the public API.
-_SENTENCE_ENDINGS = "。.?？!！"
-
-
-def _find_sentence_cut(candidate: str) -> int:
-    """Return a cut after the last valid sentence ending, ignoring decimal points."""
-    for index in range(len(candidate) - 1, -1, -1):
-        mark = candidate[index]
-        if mark not in _SENTENCE_ENDINGS:
-            continue
-        if mark == "." and 0 < index < len(candidate) - 1:
-            if candidate[index - 1].isdigit() and candidate[index + 1].isdigit():
-                continue
-        return index + 1
-    return -1
-
-
-def split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
-    """Split an oversized paragraph at the nearest preceding sentence boundary."""
-    paragraph = str(paragraph or "").strip()
-    if not paragraph:
-        return []
-    if max_chars <= 0:
-        raise ValueError("max_chars must be positive.")
-
-    parts: list[str] = []
-    remaining = paragraph
-    while len(remaining) > max_chars:
-        candidate = remaining[:max_chars]
-        cut = _find_sentence_cut(candidate)
-        if cut < 0:
-            cut = candidate.rfind(" ")
-            if cut <= 0:
-                cut = max_chars
-
-        part = remaining[:cut].strip()
-        if not part:  # Defensive progress guarantee for unusual whitespace.
-            part = remaining[:max_chars]
-            cut = max_chars
-        parts.append(part)
-        remaining = remaining[cut:].lstrip()
-
-    if remaining:
-        parts.append(remaining.strip())
-    return parts
-
-
-def _complete_sentence_overlap(text: str, section_title: str, overlap_chars: int) -> str:
-    """Return a short suffix composed only of complete sentences."""
-    if overlap_chars <= 0:
-        return ""
-    body = text.strip()
-    if section_title and body.startswith(section_title):
-        body = body[len(section_title):].lstrip()
-    sentences = [
-        match.group(0).strip()
-        for match in re.finditer(rf"[^{re.escape(_SENTENCE_ENDINGS)}]+[{re.escape(_SENTENCE_ENDINGS)}]", body)
-        if match.group(0).strip()
-    ]
-    selected: list[str] = []
-    total = 0
-    for sentence in reversed(sentences):
-        added = len(sentence) + (1 if selected else 0)
-        if added > overlap_chars or total + added > overlap_chars:
-            break
-        selected.append(sentence)
-        total += added
-    return " ".join(reversed(selected))
-
-
-def chunk_text(text: str, max_chars: int = 3000, overlap_chars: int = 250) -> list[dict[str, Any]]:
-    """Build section-aware chunks using paragraph and sentence boundaries."""
-    if max_chars <= 500:
-        raise BriefingError("--max-chars should be greater than 500.")
-    if overlap_chars < 0 or overlap_chars >= max_chars:
-        raise BriefingError("--overlap must be non-negative and smaller than --max-chars.")
-
-    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n+", text) if paragraph.strip()]
-    chunks: list[dict[str, Any]] = []
-    current_parts: list[str] = []
-    current_section = ""
-
-    def render(parts: list[str], section_title: str) -> str:
-        body = "\n\n".join(part for part in parts if part).strip()
-        if section_title and not body.startswith(section_title):
-            return f"{section_title}\n\n{body}" if body else section_title
-        return body
-
-    def save_current() -> str:
-        if not current_parts:
-            return ""
-        body = render(current_parts, current_section)
-        chunks.append({
-            "chunk_id": len(chunks) + 1,
-            "section_title": current_section,
-            "text": body,
-        })
-        return body
-
-    for paragraph in paragraphs:
-        detected_title = detect_section_title(paragraph)
-        if detected_title:
-            if current_parts:
-                save_current()
-                current_parts = []
-            current_section = detected_title
-            current_parts = [detected_title]
-            continue
-
-        content_limit = max_chars - (len(current_section) + 2 if current_section else 0)
-        pieces = split_long_paragraph(paragraph, max(1, content_limit))
-        for piece in pieces:
-            proposed = render(current_parts + [piece], current_section)
-            if current_parts and len(proposed) > max_chars:
-                previous_body = save_current()
-                overlap = _complete_sentence_overlap(previous_body, current_section, overlap_chars)
-                current_parts = [overlap] if overlap else []
-                proposed = render(current_parts + [piece], current_section)
-                if overlap and len(proposed) > max_chars:
-                    current_parts = []
-            current_parts.append(piece)
-
-    if current_parts:
-        save_current()
-    return chunks
-
-
 def build_nil_prompt(chunk: dict[str, Any]) -> str:
     """Build the per-chunk NIL extraction prompt."""
     return f"""
-输出长度与筛选约束：
-- named_terms 最多 10 条；important_actions 最多 8 条；literals_data 最多 8 条；candidate_insights 最多 5 条。
-- 每个 context / meaning 字段尽量控制在 60 个中文字符以内，不要输出长段落。
-- 只筛选与最终 PPT 相关的原文信息：核心愿景、efficiency / Intelligence per Joule、Hardware / Algorithm / Application、2-5 年近期趋势、6-10 年远期趋势、3D Integration、Photonics、Compute-in-memory、HBM、Chiplet、AI+HW co-design、Energy efficiency。
-- 上述关键词仅用于筛选相关信息，不得作为最终答案硬编码；原文未提及的信息不得添加。
-
 你是一名资深 AI+硬件协同设计技术分析师。
 
 任务：从下面这个论文 chunk 中抽取 NIL 中间层信息。
@@ -515,12 +378,6 @@ def build_merge_nil_prompt(nil_results: list[dict[str, Any]]) -> str:
     """Build the NIL merge prompt."""
     nil_json = json.dumps(nil_results, ensure_ascii=False, indent=2)
     return f"""
-合并输出约束：
-- global_named_terms 最多 20 条；global_actions 最多 15 条；global_data 最多 15 条；high_confidence_insights 最多 10 条。
-- 每个 merged_context / meaning / insight 控制在 80 个中文字符以内。
-- 不要输出重复内容，优先保留与最终 PPT 直接相关的信息。
-- 只输出严格 JSON，不要 Markdown，不要解释文字。
-
 你是一名资深 AI+硬件协同设计技术分析师。
 
 任务：合并多个 chunk 的 NIL 结果，去重并保留来源 chunk_id。
@@ -584,12 +441,6 @@ def build_final_extraction_prompt(merged_nil: dict[str, Any], selected_context: 
     """Build the final briefing extraction prompt."""
     merged_nil_json = json.dumps(merged_nil, ensure_ascii=False, indent=2)
     return f"""
-最终 JSON 长度约束：
-- core_vision.headline 不超过 20 个中文字符；intelligence_per_joule 不超过 80 个中文字符；target_explanation 不超过 120 个中文字符。
-- 每个 layer 的 role 不超过 80 个中文字符；key_features 最多 3 条且每条不超过 40 个中文字符；examples 最多 2 条且每条不超过 30 个中文字符。
-- timeline 每个 stage 的 trends 最多 3 条且每条不超过 40 个中文字符；meaning 不超过 100 个中文字符。
-- one_sentence_summary 不超过 60 个中文字符。
-
 你是一名资深 AI+硬件协同设计技术分析师和 PPT 简报架构师。
 
 任务：基于 merged NIL 和 selected original context，生成最终 briefing JSON。
@@ -656,38 +507,23 @@ selected original context：
 """.strip()
 
 
-def call_llm(prompt: str, temperature: float = 0.2) -> str:
+def call_llm(prompt: str) -> str:
     """Call the configured OpenAI-compatible Chat Completions API."""
     if _LLM_CLIENT is None:
         raise BriefingError("LLM client is not configured.")
 
-    request_args = {
-        "model": _LLM_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You return only valid JSON when asked for JSON. Do not include Markdown.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": temperature,
-    }
     try:
-        try:
-            response = _LLM_CLIENT.chat.completions.create(
-                **request_args,
-                response_format={"type": "json_object"},
-            )
-        except Exception as format_exc:
-            message = str(format_exc).lower()
-            unsupported_json_mode = (
-                "response_format" in message
-                or "json_object" in message
-                or ("json mode" in message and ("unsupported" in message or "not support" in message))
-            )
-            if not unsupported_json_mode:
-                raise
-            response = _LLM_CLIENT.chat.completions.create(**request_args)
+        response = _LLM_CLIENT.chat.completions.create(
+            model=_LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You return only valid JSON when asked for JSON. Do not include Markdown.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
         content = response.choices[0].message.content or ""
     except Exception as exc:
         error_message = str(exc)
@@ -702,43 +538,16 @@ def call_llm(prompt: str, temperature: float = 0.2) -> str:
 
 
 def parse_json_strict(raw_output: str) -> Any:
-    """Extract and parse the first complete JSON object from an LLM response."""
-    text = raw_output.replace("\ufeff", "")
-    text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE)
-    text = "".join(char for char in text if ord(char) >= 32)
-    start = text.find("{")
-    if start < 0:
-        raise json.JSONDecodeError("No JSON object found", text, 0)
-
-    depth = 0
-    in_string = False
-    escaped = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start:index + 1])
-    raise json.JSONDecodeError("Incomplete JSON object", text, start)
+    """Parse JSON, accepting accidental fenced code blocks but no extra prose."""
+    text = raw_output.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    return json.loads(text)
 
 
 def repair_json(raw_output: str, expected_schema_hint: str) -> Any:
     """Ask the LLM to repair invalid JSON without adding new information."""
     prompt = f"""
-只修复下面内容的 JSON 语法：不添加新事实，不删除已有关键信息，不输出 Markdown，不输出解释文字，只输出一个合法 JSON 对象。
-
 你只需要修复 JSON 格式。
 
 规则：
@@ -752,23 +561,8 @@ def repair_json(raw_output: str, expected_schema_hint: str) -> Any:
 需要修复的原始输出：
 {raw_output}
 """.strip()
-    try:
-        repaired = call_llm(prompt, temperature=0)
-    except Exception:
-        configured_key = getattr(_LLM_CLIENT, "api_key", None)
-        safe_raw = raw_output.replace(configured_key, "[REDACTED]") if configured_key else raw_output
-        Path("debug_raw_llm_output.txt").write_text(safe_raw, encoding="utf-8")
-        Path("debug_repaired_llm_output.txt").write_text("", encoding="utf-8")
-        raise
-    try:
-        return parse_json_strict(repaired)
-    except Exception:
-        configured_key = getattr(_LLM_CLIENT, "api_key", None)
-        safe_raw = raw_output.replace(configured_key, "[REDACTED]") if configured_key else raw_output
-        safe_repaired = repaired.replace(configured_key, "[REDACTED]") if configured_key else repaired
-        Path("debug_raw_llm_output.txt").write_text(safe_raw, encoding="utf-8")
-        Path("debug_repaired_llm_output.txt").write_text(safe_repaired, encoding="utf-8")
-        raise
+    repaired = call_llm(prompt)
+    return parse_json_strict(repaired)
 
 
 def parse_or_repair_json(raw_output: str, expected_schema_hint: str) -> Any:
@@ -791,10 +585,8 @@ def extract_briefing_data(chunks: list[dict[str, Any]]) -> dict[str, Any]:
         raise BriefingError("No chunks were generated from the input document.")
 
     nil_results = nil_preprocess(chunks)
-    print("Merging NIL results...")
     merged_nil = merge_nil_results(nil_results)
     selected_context = _select_context(chunks, merged_nil)
-    print("Extracting final briefing JSON...")
     raw = call_llm(build_final_extraction_prompt(merged_nil, selected_context))
     schema_hint = "Final briefing JSON with paper_title, core_vision, layers, timeline, one_sentence_summary."
     data = parse_or_repair_json(raw, schema_hint)
@@ -1143,231 +935,13 @@ def _normalize_timeline(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def force_font(run, font_name: str) -> None:
-    """Force Latin, East Asian, and complex-script typefaces in run XML."""
-    run_properties = run._r.get_or_add_rPr()
-    for tag in ("a:latin", "a:ea", "a:cs"):
-        font = run_properties.find(qn(tag))
-        if font is None:
-            font = OxmlElement(tag)
-            run_properties.append(font)
-        font.set("typeface", font_name)
-
-
-def set_run_font(
-    run,
-    font_name: str = "华文新魏",
-    font_size: int = 18,
-    bold: bool = False,
-    color: RGBColor | None = None,
-) -> None:
-    """Apply the presentation's typography consistently to one text run."""
-    run.font.name = font_name
-    run.font.size = Pt(font_size)
-    run.font.bold = bold
-    if color is not None:
-        run.font.color.rgb = color
-    force_font(run, font_name)
-
-
-def add_textbox(
-    slide,
-    text: Any,
-    x: float,
-    y: float,
-    w: float,
-    h: float,
-    font_size: int = 18,
-    font_name: str = "华文新魏",
-    bold: bool = False,
-    color: RGBColor | None = None,
-    align: str = "left",
-):
-    """Add a fixed-size, padded text box and style every non-empty line."""
-    textbox = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
-    frame = textbox.text_frame
-    frame.clear()
-    frame.word_wrap = True
-    frame.auto_size = None
-    frame.margin_left = Inches(0.08)
-    frame.margin_right = Inches(0.08)
-    frame.margin_top = Inches(0.05)
-    frame.margin_bottom = Inches(0.05)
-    lines = str(text or "").splitlines() or [""]
-    lines = [line for line in lines if line.strip()] or [""]
-    paragraph_alignment = PP_ALIGN.CENTER if str(align).lower() == "center" else PP_ALIGN.LEFT
-    for index, line in enumerate(lines):
-        paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
-        paragraph.alignment = paragraph_alignment
-        paragraph.space_after = Pt(3)
-        run = paragraph.add_run()
-        run.text = line
-        set_run_font(run, font_name, font_size, bold, color or COLORS["deep_gray"])
-    return textbox
-
-
-def shorten_text(text: Any, max_len: int) -> str:
-    """Shorten display text at natural boundaries without splitting technical terms."""
-    if text is None:
-        return ""
-    value = re.sub(r"\s+", " ", str(text)).strip()
-    if not value:
-        return ""
-    if len(value) <= max_len:
-        return value
-
-    protected_phrases = (
-        "AI-in-the-loop",
-        "differentiable simulator",
-        "hardware-aware training",
-        "neural architecture search",
-    )
-    cutoff = max_len
-    lower_value = value.lower()
-    protected_spans = []
-    for phrase in protected_phrases:
-        start = lower_value.find(phrase.lower())
-        end = start + len(phrase)
-        if start >= 0:
-            protected_spans.append((start, end))
-        if start >= 0 and start < cutoff < end:
-            cutoff = end
-
-    # Never split a hyphenated word or another contiguous English token.
-    if 0 < cutoff < len(value) and re.match(r"[A-Za-z0-9-]", value[cutoff - 1]) and re.match(r"[A-Za-z0-9-]", value[cutoff]):
-        token_end = re.search(r"[^A-Za-z0-9-]", value[cutoff:])
-        cutoff = cutoff + token_end.start() if token_end else len(value)
-
-    if cutoff >= len(value):
-        return value
-
-    minimum_boundary = max(1, int(max_len * 0.6))
-    boundary_chars = "，。,.;； "
-    boundary = max((value.rfind(char, minimum_boundary, cutoff + 1) for char in boundary_chars), default=-1)
-    if boundary >= minimum_boundary:
-        containing_span = next(((start, end) for start, end in protected_spans if start < boundary < end), None)
-        cutoff = containing_span[1] if containing_span else boundary + (1 if value[boundary] != " " else 0)
-
-    shortened = value[:cutoff].rstrip(" ，。,.;；")
-    return shortened + "…"
-
-
-def shorten_list(items: Any, max_items: int, max_len_each: int) -> list[str]:
-    """Limit list length and shorten each item for fixed PPT layouts."""
-    if not isinstance(items, list):
-        items = [items] if items else []
-    return [value for value in (shorten_text(item, max_len_each) for item in items[:max_items]) if value]
-
-
-def _limit_ellipsis(items: list[str], max_count: int = 1) -> list[str]:
-    """Limit ellipses across one card while preserving already shortened phrases."""
-    used = 0
-    result = []
-    for item in items:
-        if "…" in item:
-            if used >= max_count:
-                item = item.replace("…", "")
-            else:
-                used += 1
-        result.append(item)
-    return result
-
-
-def add_title_slide(prs: Presentation, data: dict[str, Any]) -> None:
-    """Add a minimal centered cover containing only title, vision, and footer."""
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _add_background(slide, COLORS["deep_blue"])
-    title = shorten_text(data.get("paper_title", "论文标题未明确说明"), 35)
-    core = data.get("core_vision", {}) or {}
-    headline = shorten_text(core.get("headline", "核心愿景未明确说明"), 35)
-    add_textbox(slide, title, 0.8, 1.8, 11.7, 1.0, font_size=30, bold=True, color=COLORS["white"], align="center")
-    add_textbox(slide, headline, 0.8, 3.2, 11.7, 1.0, font_size=30, bold=True, color=COLORS["white"], align="center")
-    add_textbox(
-        slide, "AI + Hardware Co-design Briefing", 0.8, 6.6, 11.7, 0.4,
-        font_size=18, color=COLORS["white"], align="center",
-    )
-
-
-def _add_layer_card_v2(slide, x: float, layer: dict[str, Any]) -> None:
-    y, w, h = 1.25, 3.75, 5.75
-    card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
-    card.fill.solid()
-    card.fill.fore_color.rgb = COLORS["white"]
-    card.line.color.rgb = RGBColor(0xD8, 0xE3, 0xF0)
-    name = shorten_text(layer.get("name", "未明确说明"), 18)
-    role = shorten_text(layer.get("role", "论文未明确说明"), 36)
-    features = shorten_list(layer.get("key_features", []), 2, 24)
-    examples = shorten_list(layer.get("examples", []), 1, 24)
-    card_texts = _limit_ellipsis([role, *features, *examples])
-    role = card_texts[0]
-    features = card_texts[1:1 + len(features)]
-    examples = card_texts[1 + len(features):]
-    body_lines = ["核心作用：", role, "", "关键特征："]
-    body_lines.extend(f"• {feature}" for feature in features)
-    body_lines.extend(["", "例子：", examples[0] if examples else "论文未明确说明"])
-    add_textbox(slide, name, x + 0.22, y + 0.25, w - 0.44, 0.55, font_size=20, bold=True, color=COLORS["deep_blue"], align="center")
-    add_textbox(slide, "\n".join(body_lines), x + 0.25, y + 0.95, w - 0.50, 4.45, font_size=18, color=COLORS["deep_gray"], align="left")
-
-
-def add_layers_slide(prs: Presentation, data: dict[str, Any]) -> None:
-    """Add three equally sized, non-overlapping abstraction-layer cards."""
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _add_background(slide, COLORS["light_gray"])
-    add_textbox(
-        slide, "三大抽象层级：Hardware × Algorithm × Application", 0.55, 0.35, 12.2, 0.62,
-        font_size=20, bold=True, color=COLORS["deep_blue"], align="center",
-    )
-    for x, layer in zip((0.55, 4.79, 9.03), _normalize_layers(data.get("layers", []))):
-        _add_layer_card_v2(slide, x, layer)
-
-
-def _add_timeline_card_v2(slide, x: float, stage: dict[str, Any]) -> None:
-    y, w, h = 3.25, 5.6, 3.2
-    card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
-    card.fill.solid()
-    card.fill.fore_color.rgb = COLORS["light_blue"]
-    card.line.color.rgb = RGBColor(0xB8, 0xD8, 0xF6)
-    title = f"{shorten_text(stage.get('stage', ''), 6)}  {shorten_text(stage.get('range', ''), 12)}"
-    trends = shorten_list(stage.get("trends", []), 2, 26)
-    meaning = shorten_text(stage.get("meaning", "论文未明确说明"), 38)
-    body_lines = ["趋势："]
-    body_lines.extend(f"• {trend}" for trend in trends)
-    body_lines.extend(["", "意义：", meaning])
-    add_textbox(slide, title, x + 0.30, y + 0.24, w - 0.60, 0.52, font_size=20, bold=True, color=COLORS["deep_blue"], align="center")
-    add_textbox(slide, "\n".join(body_lines), x + 0.34, y + 0.92, w - 0.68, 1.98, font_size=18, color=COLORS["deep_gray"], align="left")
-
-
-def add_timeline_slide(prs: Presentation, data: dict[str, Any]) -> None:
-    """Add a horizontal two-stage timeline with cards below the line."""
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _add_background(slide, COLORS["white"])
-    add_textbox(slide, "技术演进时间轴：近期到远期", 0.55, 0.35, 12.2, 0.62, font_size=20, bold=True, color=COLORS["deep_blue"], align="center")
-    timeline = _normalize_timeline(data.get("timeline", []))
-    line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(1.3), Inches(2.85), Inches(12.0), Inches(2.85))
-    line.line.color.rgb = COLORS["tech_blue"]
-    line.line.width = Pt(3)
-    try:
-        line.line.end_arrowhead = True
-    except Exception:
-        pass
-    for node_x in (3.35, 9.45):
-        node = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, Inches(node_x), Inches(2.60), Inches(0.5), Inches(0.5))
-        node.fill.solid()
-        node.fill.fore_color.rgb = COLORS["tech_blue"]
-        node.line.color.rgb = COLORS["white"]
-    add_textbox(slide, "近期", 2.85, 2.05, 1.5, 0.45, font_size=20, bold=True, color=COLORS["deep_blue"], align="center")
-    add_textbox(slide, "远期", 8.95, 2.05, 1.5, 0.45, font_size=20, bold=True, color=COLORS["deep_blue"], align="center")
-    _add_timeline_card_v2(slide, 0.6, timeline[0])
-    _add_timeline_card_v2(slide, 7.1, timeline[1])
-
-
 def main() -> None:
     global _LLM_CLIENT, _LLM_MODEL
     parser = argparse.ArgumentParser(description="Generate an AI + hardware co-design briefing deck from a PDF or TXT paper.")
     parser.add_argument("--input", required=True, help="Input paper path, PDF or TXT.")
     parser.add_argument("--output", default="briefing.pptx", help="Output PPTX path. Default: briefing.pptx")
-    parser.add_argument("--max-chars", type=int, default=7000, help="Maximum characters per chunk. Default: 7000")
-    parser.add_argument("--overlap", type=int, default=300, help="Overlap characters between chunks. Default: 300")
+    parser.add_argument("--max-chars", type=int, default=3000, help="Maximum characters per chunk. Default: 3000")
+    parser.add_argument("--overlap", type=int, default=250, help="Overlap characters between chunks. Default: 250")
     parser.add_argument("--api-key", help="API key (prefer hidden prompt or an environment variable).")
     parser.add_argument("--base-url", help="OpenAI-compatible API base URL. Defaults to the OpenAI endpoint.")
     parser.add_argument("--model", help="Model name. Default: API_MODEL or gpt-4o-mini.")
@@ -1380,9 +954,7 @@ def main() -> None:
         if not text:
             raise BriefingError("Input document contains no usable text after cleaning.")
         chunks = chunk_text(text, max_chars=args.max_chars, overlap_chars=args.overlap)
-        print(f"Document split into {len(chunks)} chunks.")
         data = extract_briefing_data(chunks)
-        print("Creating PPT...")
         create_ppt(data, args.output)
         print(f"{args.output} generated successfully.")
     except BriefingError as exc:

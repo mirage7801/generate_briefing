@@ -28,7 +28,6 @@ from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
 from pptx.util import Inches, Pt
 from pypdf import PdfReader
 
-
 DEFAULT_MODEL = "gpt-4o-mini"
 _LLM_CLIENT: OpenAI | None = None
 _LLM_MODEL = DEFAULT_MODEL
@@ -63,7 +62,11 @@ def get_llm_config(args: argparse.Namespace) -> tuple[OpenAI, str]:
 
     base_url = getattr(args, "base_url", None) or os.getenv("API_BASE_URL")
     model = getattr(args, "model", None) or os.getenv("API_MODEL") or DEFAULT_MODEL
-    client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+    client = (
+        OpenAI(api_key=api_key, base_url=base_url)
+        if base_url
+        else OpenAI(api_key=api_key)
+    )
     return client, model
 
 
@@ -85,7 +88,9 @@ def load_document(file_path: str | Path) -> str:
             try:
                 extracted = page.extract_text() or ""
             except Exception as exc:
-                warnings.warn(f"Page {idx} could not be extracted and was skipped: {exc}")
+                warnings.warn(
+                    f"Page {idx} could not be extracted and was skipped: {exc}"
+                )
                 continue
             if extracted.strip():
                 page_texts.append(extracted)
@@ -166,7 +171,10 @@ def detect_section_title(paragraph: str) -> str:
     words = text.split()
     if 1 <= len(words) <= 8 and text[:1].isupper():
         alpha_chars = re.sub(r"[^A-Za-z]", "", text)
-        if alpha_chars and sum(ch.isupper() for ch in alpha_chars) / len(alpha_chars) > 0.65:
+        if (
+            alpha_chars
+            and sum(ch.isupper() for ch in alpha_chars) / len(alpha_chars) > 0.65
+        ):
             return text
 
     return ""
@@ -218,12 +226,16 @@ def split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
     return parts
 
 
-def chunk_text(text: str, max_chars: int = 3000, overlap_chars: int = 250) -> list[dict[str, Any]]:
+def chunk_text(
+    text: str, max_chars: int = 3000, overlap_chars: int = 250
+) -> list[dict[str, Any]]:
     """Create section-aware, overlapped text chunks."""
     if max_chars <= 500:
         raise BriefingError("--max-chars should be greater than 500.")
     if overlap_chars < 0 or overlap_chars >= max_chars:
-        raise BriefingError("--overlap must be non-negative and smaller than --max-chars.")
+        raise BriefingError(
+            "--overlap must be non-negative and smaller than --max-chars."
+        )
 
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
     chunks: list[dict[str, Any]] = []
@@ -242,7 +254,12 @@ def chunk_text(text: str, max_chars: int = 3000, overlap_chars: int = 250) -> li
             return ""
         tail = chunk_body[-overlap_chars:].strip()
         first_boundary = min(
-            [pos for pos in [tail.find("\n\n"), tail.find(". "), tail.find("。")] if pos >= 0] or [-1]
+            [
+                pos
+                for pos in [tail.find("\n\n"), tail.find(". "), tail.find("。")]
+                if pos >= 0
+            ]
+            or [-1]
         )
         if first_boundary >= 0 and first_boundary + 2 < len(tail):
             tail = tail[first_boundary + 2 :].strip()
@@ -364,11 +381,15 @@ def nil_preprocess(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     schema_hint = "NIL JSON with chunk_id, section_title, named_terms, important_actions, literals_data, candidate_insights."
 
     for chunk in chunks:
-        print(f"Running NIL preprocessing for chunk {chunk['chunk_id']}/{len(chunks)}...")
+        print(
+            f"Running NIL preprocessing for chunk {chunk['chunk_id']}/{len(chunks)}..."
+        )
         raw = call_llm(build_nil_prompt(chunk))
         parsed = parse_or_repair_json(raw, schema_hint)
         parsed["chunk_id"] = chunk["chunk_id"]
-        parsed["section_title"] = parsed.get("section_title") or chunk.get("section_title", "")
+        parsed["section_title"] = parsed.get("section_title") or chunk.get(
+            "section_title", ""
+        )
         nil_results.append(parsed)
 
     return nil_results
@@ -437,7 +458,9 @@ def merge_nil_results(nil_results: list[dict[str, Any]]) -> dict[str, Any]:
     return parse_or_repair_json(raw, schema_hint)
 
 
-def build_final_extraction_prompt(merged_nil: dict[str, Any], selected_context: str) -> str:
+def build_final_extraction_prompt(
+    merged_nil: dict[str, Any], selected_context: str
+) -> str:
     """Build the final briefing extraction prompt."""
     merged_nil_json = json.dumps(merged_nil, ensure_ascii=False, indent=2)
     return f"""
@@ -637,10 +660,18 @@ def _select_context(chunks: list[dict[str, Any]], merged_nil: dict[str, Any]) ->
 
 
 def _validate_briefing_data(data: dict[str, Any]) -> None:
-    required = ["paper_title", "core_vision", "layers", "timeline", "one_sentence_summary"]
+    required = [
+        "paper_title",
+        "core_vision",
+        "layers",
+        "timeline",
+        "one_sentence_summary",
+    ]
     missing = [key for key in required if key not in data]
     if missing:
-        raise BriefingError(f"Final briefing JSON is missing required fields: {', '.join(missing)}")
+        raise BriefingError(
+            f"Final briefing JSON is missing required fields: {', '.join(missing)}"
+        )
 
     if not isinstance(data.get("layers"), list) or len(data["layers"]) < 3:
         raise BriefingError("Final briefing JSON must contain three layers.")
@@ -691,18 +722,45 @@ def add_title_slide(prs: Presentation, data: dict[str, Any]) -> None:
     card.fill.fore_color.rgb = COLORS["white"]
     card.line.color.rgb = RGBColor(0x99, 0xCC, 0xFF)
 
-    _add_textbox(slide, "CORE VISION", 8.05, 1.18, 3.8, 0.35, 11, COLORS["tech_blue"], bold=True)
-    _add_textbox(slide, highlight, 8.0, 1.55, 4.0, 0.78, 30, COLORS["deep_blue"], bold=True)
-    _add_textbox(slide, headline, 8.0, 2.35, 4.1, 0.7, 15, COLORS["deep_gray"], bold=True)
+    _add_textbox(
+        slide, "CORE VISION", 8.05, 1.18, 3.8, 0.35, 11, COLORS["tech_blue"], bold=True
+    )
+    _add_textbox(
+        slide, highlight, 8.0, 1.55, 4.0, 0.78, 30, COLORS["deep_blue"], bold=True
+    )
+    _add_textbox(
+        slide, headline, 8.0, 2.35, 4.1, 0.7, 15, COLORS["deep_gray"], bold=True
+    )
 
     ipj = shorten_text(core.get("intelligence_per_joule", "论文未明确说明"), 100)
     target = shorten_text(core.get("target_explanation", "论文未明确说明"), 130)
-    _add_textbox(slide, "Intelligence per Joule", 8.0, 3.22, 4.1, 0.35, 13, COLORS["tech_blue"], bold=True)
+    _add_textbox(
+        slide,
+        "Intelligence per Joule",
+        8.0,
+        3.22,
+        4.1,
+        0.35,
+        13,
+        COLORS["tech_blue"],
+        bold=True,
+    )
     _add_textbox(slide, ipj, 8.0, 3.62, 4.0, 0.85, 13, COLORS["deep_gray"])
-    _add_textbox(slide, "为什么重要", 8.0, 4.72, 4.1, 0.35, 13, COLORS["tech_blue"], bold=True)
+    _add_textbox(
+        slide, "为什么重要", 8.0, 4.72, 4.1, 0.35, 13, COLORS["tech_blue"], bold=True
+    )
     _add_textbox(slide, target, 8.0, 5.1, 4.0, 0.75, 12, COLORS["deep_gray"])
 
-    _add_textbox(slide, "AI + Hardware Co-design Briefing", 0.72, 6.75, 5.0, 0.35, 12, RGBColor(0xC7, 0xE5, 0xFF))
+    _add_textbox(
+        slide,
+        "AI + Hardware Co-design Briefing",
+        0.72,
+        6.75,
+        5.0,
+        0.35,
+        12,
+        RGBColor(0xC7, 0xE5, 0xFF),
+    )
 
 
 def add_layers_slide(prs: Presentation, data: dict[str, Any]) -> None:
@@ -731,7 +789,17 @@ def add_timeline_slide(prs: Presentation, data: dict[str, Any]) -> None:
     """Add horizontal timeline slide."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, COLORS["white"])
-    _add_textbox(slide, "技术演进时间轴：近期到远期", 0.55, 0.42, 12.0, 0.55, 24, COLORS["deep_blue"], bold=True)
+    _add_textbox(
+        slide,
+        "技术演进时间轴：近期到远期",
+        0.55,
+        0.42,
+        12.0,
+        0.55,
+        24,
+        COLORS["deep_blue"],
+        bold=True,
+    )
 
     timeline = _normalize_timeline(data.get("timeline", []))
     line = slide.shapes.add_connector(
@@ -750,14 +818,38 @@ def add_timeline_slide(prs: Presentation, data: dict[str, Any]) -> None:
 
     node_specs = [(3.25, timeline[0]), (9.25, timeline[1])]
     for x, stage in node_specs:
-        node = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.OVAL, Inches(x), Inches(2.98), Inches(0.5), Inches(0.5))
+        node = slide.shapes.add_shape(
+            MSO_AUTO_SHAPE_TYPE.OVAL, Inches(x), Inches(2.98), Inches(0.5), Inches(0.5)
+        )
         node.fill.solid()
         node.fill.fore_color.rgb = COLORS["tech_blue"]
         node.line.color.rgb = COLORS["white"]
         _add_timeline_card(slide, x - 1.45, 3.75, 3.45, 2.75, stage)
 
-    _add_textbox(slide, "近期", 2.75, 2.45, 1.5, 0.35, 14, COLORS["deep_blue"], bold=True, align=PP_ALIGN.CENTER)
-    _add_textbox(slide, "远期", 8.75, 2.45, 1.5, 0.35, 14, COLORS["deep_blue"], bold=True, align=PP_ALIGN.CENTER)
+    _add_textbox(
+        slide,
+        "近期",
+        2.75,
+        2.45,
+        1.5,
+        0.35,
+        14,
+        COLORS["deep_blue"],
+        bold=True,
+        align=PP_ALIGN.CENTER,
+    )
+    _add_textbox(
+        slide,
+        "远期",
+        8.75,
+        2.45,
+        1.5,
+        0.35,
+        14,
+        COLORS["deep_blue"],
+        bold=True,
+        align=PP_ALIGN.CENTER,
+    )
 
 
 def shorten_text(text: Any, max_len: int) -> str:
@@ -802,7 +894,9 @@ def _add_background(slide, color: RGBColor) -> None:
 
 
 def _add_accent_bar(slide) -> None:
-    bar = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0), Inches(0), Inches(0.18), Inches(7.5))
+    bar = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0), Inches(0), Inches(0.18), Inches(7.5)
+    )
     bar.fill.solid()
     bar.fill.fore_color.rgb = COLORS["tech_blue"]
     bar.line.fill.background()
@@ -841,7 +935,15 @@ def _add_textbox(
     return textbox
 
 
-def _add_bullets(slide, bullets: list[str], x: float, y: float, w: float, h: float, font_size: int = 11):
+def _add_bullets(
+    slide,
+    bullets: list[str],
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    font_size: int = 11,
+):
     textbox = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
     frame = textbox.text_frame
     frame.clear()
@@ -858,8 +960,16 @@ def _add_bullets(slide, bullets: list[str], x: float, y: float, w: float, h: flo
     return textbox
 
 
-def _add_layer_card(slide, x: float, y: float, w: float, h: float, layer: dict[str, Any]) -> None:
-    card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+def _add_layer_card(
+    slide, x: float, y: float, w: float, h: float, layer: dict[str, Any]
+) -> None:
+    card = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+        Inches(x),
+        Inches(y),
+        Inches(w),
+        Inches(h),
+    )
     card.fill.solid()
     card.fill.fore_color.rgb = COLORS["white"]
     card.line.color.rgb = RGBColor(0xD8, 0xE3, 0xF0)
@@ -869,18 +979,56 @@ def _add_layer_card(slide, x: float, y: float, w: float, h: float, layer: dict[s
     features = join_bullets(layer.get("key_features", []), 3, 34)
     examples = join_bullets(layer.get("examples", []), 2, 34)
 
-    _add_textbox(slide, name, x + 0.25, y + 0.25, w - 0.5, 0.45, 19, COLORS["deep_blue"], bold=True)
+    _add_textbox(
+        slide,
+        name,
+        x + 0.25,
+        y + 0.25,
+        w - 0.5,
+        0.45,
+        19,
+        COLORS["deep_blue"],
+        bold=True,
+    )
     _add_textbox(slide, role, x + 0.25, y + 0.82, w - 0.5, 0.78, 11, COLORS["mid_gray"])
 
-    _add_textbox(slide, "关键特征", x + 0.25, y + 1.78, w - 0.5, 0.3, 12, COLORS["tech_blue"], bold=True)
+    _add_textbox(
+        slide,
+        "关键特征",
+        x + 0.25,
+        y + 1.78,
+        w - 0.5,
+        0.3,
+        12,
+        COLORS["tech_blue"],
+        bold=True,
+    )
     _add_bullets(slide, features, x + 0.35, y + 2.16, w - 0.65, 1.25, 10)
 
-    _add_textbox(slide, "代表性技术或例子", x + 0.25, y + 3.72, w - 0.5, 0.3, 12, COLORS["tech_blue"], bold=True)
+    _add_textbox(
+        slide,
+        "代表性技术或例子",
+        x + 0.25,
+        y + 3.72,
+        w - 0.5,
+        0.3,
+        12,
+        COLORS["tech_blue"],
+        bold=True,
+    )
     _add_bullets(slide, examples, x + 0.35, y + 4.1, w - 0.65, 0.95, 10)
 
 
-def _add_timeline_card(slide, x: float, y: float, w: float, h: float, stage: dict[str, Any]) -> None:
-    card = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+def _add_timeline_card(
+    slide, x: float, y: float, w: float, h: float, stage: dict[str, Any]
+) -> None:
+    card = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+        Inches(x),
+        Inches(y),
+        Inches(w),
+        Inches(h),
+    )
     card.fill.solid()
     card.fill.fore_color.rgb = COLORS["light_blue"]
     card.line.color.rgb = RGBColor(0xB8, 0xD8, 0xF6)
@@ -889,9 +1037,21 @@ def _add_timeline_card(slide, x: float, y: float, w: float, h: float, stage: dic
     trends = join_bullets(stage.get("trends", []), 3, 34)
     meaning = shorten_text(stage.get("meaning", "论文未明确说明"), 70)
 
-    _add_textbox(slide, title, x + 0.25, y + 0.22, w - 0.5, 0.4, 16, COLORS["deep_blue"], bold=True)
+    _add_textbox(
+        slide,
+        title,
+        x + 0.25,
+        y + 0.22,
+        w - 0.5,
+        0.4,
+        16,
+        COLORS["deep_blue"],
+        bold=True,
+    )
     _add_bullets(slide, trends, x + 0.35, y + 0.78, w - 0.7, 0.95, 10)
-    _add_textbox(slide, meaning, x + 0.25, y + 1.86, w - 0.5, 0.62, 10, COLORS["deep_gray"])
+    _add_textbox(
+        slide, meaning, x + 0.25, y + 1.86, w - 0.5, 0.62, 10, COLORS["deep_gray"]
+    )
 
 
 def _extract_highlight(headline: str) -> str:
@@ -905,7 +1065,11 @@ def _extract_highlight(headline: str) -> str:
 
 def _normalize_layers(layers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     desired = ["Hardware", "Algorithm", "Application"]
-    by_name = {str(layer.get("name", "")).lower(): layer for layer in layers if isinstance(layer, dict)}
+    by_name = {
+        str(layer.get("name", "")).lower(): layer
+        for layer in layers
+        if isinstance(layer, dict)
+    }
     normalized = []
     for name in desired:
         layer = by_name.get(name.lower())
@@ -922,14 +1086,28 @@ def _normalize_layers(layers: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _normalize_timeline(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
     defaults = [
-        {"stage": "近期", "range": "2-5 年", "trends": ["论文未明确说明"], "meaning": "论文未明确说明"},
-        {"stage": "远期", "range": "6-10 年", "trends": ["论文未明确说明"], "meaning": "论文未明确说明"},
+        {
+            "stage": "近期",
+            "range": "2-5 年",
+            "trends": ["论文未明确说明"],
+            "meaning": "论文未明确说明",
+        },
+        {
+            "stage": "远期",
+            "range": "6-10 年",
+            "trends": ["论文未明确说明"],
+            "meaning": "论文未明确说明",
+        },
     ]
     if not isinstance(timeline, list):
         return defaults
     result = []
     for idx, default in enumerate(defaults):
-        item = timeline[idx] if idx < len(timeline) and isinstance(timeline[idx], dict) else {}
+        item = (
+            timeline[idx]
+            if idx < len(timeline) and isinstance(timeline[idx], dict)
+            else {}
+        )
         merged = {**default, **item}
         result.append(merged)
     return result
@@ -937,14 +1115,37 @@ def _normalize_timeline(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def main() -> None:
     global _LLM_CLIENT, _LLM_MODEL
-    parser = argparse.ArgumentParser(description="Generate an AI + hardware co-design briefing deck from a PDF or TXT paper.")
+    parser = argparse.ArgumentParser(
+        description="Generate an AI + hardware co-design briefing deck from a PDF or TXT paper."
+    )
     parser.add_argument("--input", required=True, help="Input paper path, PDF or TXT.")
-    parser.add_argument("--output", default="briefing.pptx", help="Output PPTX path. Default: briefing.pptx")
-    parser.add_argument("--max-chars", type=int, default=3000, help="Maximum characters per chunk. Default: 3000")
-    parser.add_argument("--overlap", type=int, default=250, help="Overlap characters between chunks. Default: 250")
-    parser.add_argument("--api-key", help="API key (prefer hidden prompt or an environment variable).")
-    parser.add_argument("--base-url", help="OpenAI-compatible API base URL. Defaults to the OpenAI endpoint.")
-    parser.add_argument("--model", help="Model name. Default: API_MODEL or gpt-4o-mini.")
+    parser.add_argument(
+        "--output",
+        default="briefing.pptx",
+        help="Output PPTX path. Default: briefing.pptx",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=3000,
+        help="Maximum characters per chunk. Default: 3000",
+    )
+    parser.add_argument(
+        "--overlap",
+        type=int,
+        default=250,
+        help="Overlap characters between chunks. Default: 250",
+    )
+    parser.add_argument(
+        "--api-key", help="API key (prefer hidden prompt or an environment variable)."
+    )
+    parser.add_argument(
+        "--base-url",
+        help="OpenAI-compatible API base URL. Defaults to the OpenAI endpoint.",
+    )
+    parser.add_argument(
+        "--model", help="Model name. Default: API_MODEL or gpt-4o-mini."
+    )
     args = parser.parse_args()
 
     try:
@@ -952,7 +1153,9 @@ def main() -> None:
         raw_text = load_document(args.input)
         text = clean_text(raw_text)
         if not text:
-            raise BriefingError("Input document contains no usable text after cleaning.")
+            raise BriefingError(
+                "Input document contains no usable text after cleaning."
+            )
         chunks = chunk_text(text, max_chars=args.max_chars, overlap_chars=args.overlap)
         data = extract_briefing_data(chunks)
         create_ppt(data, args.output)
